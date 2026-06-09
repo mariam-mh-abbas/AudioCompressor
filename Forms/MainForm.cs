@@ -452,7 +452,16 @@ namespace AudioCompressor
                     lblStatus.Text = $"Compression complete! Algorithm: {algorithm.AlgorithmName}";
 
                     // Show report
-                    ShowReport(settings, result.Length);
+                    // Decompress to calculate SNR
+                    short[] decompressed = null;
+                    try
+                    {
+                        decompressed = algorithm.Decompress(result, settings, null, CancellationToken.None);
+                    }
+                    catch { }
+
+                    // Show report with SNR
+                    ShowReport(settings, result.Length, decompressed);
                 }
             }
             catch (OperationCanceledException)
@@ -630,16 +639,32 @@ namespace AudioCompressor
 
         // ==================== SETTINGS ====================
 
+        //private void cboAlgorithm_SelectedIndexChanged(object sender, EventArgs e)
+        //{
+        //    // Show/hide relevant settings based on algorithm
+        //    AlgorithmType algo = (AlgorithmType)cboAlgorithm.SelectedIndex;
+
+        //    panelQuantSettings.Visible = (algo == AlgorithmType.NonlinearQuantization);
+        //    panelDpcmSettings.Visible = (algo == AlgorithmType.DPCM || algo == AlgorithmType.PredictiveDifferentialCoding);
+        //    panelPredictiveSettings.Visible = (algo == AlgorithmType.PredictiveDifferentialCoding);
+        //    panelDeltaSettings.Visible = (algo == AlgorithmType.DeltaModulation || algo == AlgorithmType.AdaptiveDeltaModulation);
+        //    panelAdaptiveDeltaSettings.Visible = (algo == AlgorithmType.AdaptiveDeltaModulation);
+        //}
         private void cboAlgorithm_SelectedIndexChanged(object sender, EventArgs e)
         {
-            // Show/hide relevant settings based on algorithm
             AlgorithmType algo = (AlgorithmType)cboAlgorithm.SelectedIndex;
 
             panelQuantSettings.Visible = (algo == AlgorithmType.NonlinearQuantization);
             panelDpcmSettings.Visible = (algo == AlgorithmType.DPCM || algo == AlgorithmType.PredictiveDifferentialCoding);
             panelPredictiveSettings.Visible = (algo == AlgorithmType.PredictiveDifferentialCoding);
-            panelDeltaSettings.Visible = (algo == AlgorithmType.DeltaModulation);
+            panelDeltaSettings.Visible = (algo == AlgorithmType.DeltaModulation || algo == AlgorithmType.AdaptiveDeltaModulation);
             panelAdaptiveDeltaSettings.Visible = (algo == AlgorithmType.AdaptiveDeltaModulation);
+
+
+            if (algo == AlgorithmType.AdaptiveDeltaModulation)
+                label17.Text = "Initial Step\n Size:";
+            else
+                label17.Text = "Delta Step:";
         }
 
         private CompressionSettings GetSettingsFromUI()
@@ -819,8 +844,27 @@ namespace AudioCompressor
 
         // ==================== REPORT ====================
 
-        private void ShowReport(CompressionSettings settings, int compressedSize)
+        private void ShowReport(CompressionSettings settings, int compressedSize, short[] decompressedSamples = null)
         {
+            // Calculate SNR
+            double snr = 0;
+            if (decompressedSamples != null && decompressedSamples.Length == _originalSamples.Length)
+            {
+                double signalPower = 0;
+                double noisePower = 0;
+                for (int i = 0; i < _originalSamples.Length; i++)
+                {
+                    double signal = (double)_originalSamples[i];
+                    double noise = (double)_originalSamples[i] - (double)decompressedSamples[i];
+                    signalPower += signal * signal;
+                    noisePower += noise * noise;
+                }
+                if (noisePower > 0 && signalPower > 0)
+                    snr = 10.0 * Math.Log10(signalPower / noisePower);
+                else
+                    snr = 99.99;
+            }
+
             var report = new CompressionReport
             {
                 OriginalFileInfo = _currentFileInfo,
@@ -830,10 +874,10 @@ namespace AudioCompressor
                 CompressionRatio = (double)(_originalSamples.Length * 2) / compressedSize,
                 ElapsedTime = _compressionStopwatch.Elapsed,
                 AlgorithmName = _algorithms[settings.Algorithm].AlgorithmName,
-                Settings = settings
+                Settings = settings,
+                SNR = snr
             };
 
-            // Show report form
             var reportForm = new ReportForm(report);
             reportForm.ShowDialog(this);
         }
@@ -887,6 +931,11 @@ namespace AudioCompressor
             StopPlayback();
             _cts?.Cancel();
             base.OnFormClosing(e);
+        }
+
+        private void plotSpeed_Click(object sender, EventArgs e)
+        {
+
         }
 
         // ==================== TEST ====================
