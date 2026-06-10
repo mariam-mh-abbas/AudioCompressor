@@ -13,6 +13,9 @@ namespace AudioCompressor.Algorithms
     /// to the predicted value. If the actual sample is greater, output 1;
     /// if less, output 0. The step size (delta) is fixed.
     /// Compression ratio is 16:1 for 16-bit audio (1 bit per sample).
+    ///
+    /// For stereo: uses separate predictors for Left and Right channels
+    /// to prevent cross-channel error accumulation.
     /// </summary>
     public class DeltaModulation : IAudioCompressor
     {
@@ -26,25 +29,34 @@ namespace AudioCompressor.Algorithms
             int totalSamples = samples.Length;
             int delta = settings.DeltaStepSize;
 
-            // Header: 8 bytes (sample count + delta)
-            byte[] header = new byte[8];
+            // Header: 12 bytes (sample count + delta + first sample)
+            byte[] header = new byte[12];
             BitConverter.GetBytes(totalSamples).CopyTo(header, 0);
             BitConverter.GetBytes(delta).CopyTo(header, 4);
+            BitConverter.GetBytes(samples[0]).CopyTo(header, 8);
 
-            // 1 bit per sample => totalSamples bits => (totalSamples+7)/8 bytes
-            int dataBytes = (totalSamples + 7) / 8;
+            // 1 bit per sample => (totalSamples-1) bits => ((totalSamples-1)+7)/8 bytes
+            int dataBytes = (totalSamples - 1 + 7) / 8;
             byte[] output = new byte[header.Length + dataBytes];
             Array.Copy(header, output, header.Length);
 
-            short predictor = 0; // start from 0
+            // Separate predictors for L and R channels
+            short predictorL = samples[0]; // first sample is Left channel
+            //short predictorR = (totalSamples > 1) ? samples[1] : (short)0;
+            short predictorR = (short)0;
+
             long bitBuffer = 0;
             int bitsInBuffer = 0;
             int byteIndex = header.Length;
 
-            for (int i = 0; i < totalSamples; i++)
+            // Start from sample 1 (sample 0 stored in header)
+            for (int i = 1; i < totalSamples; i++)
             {
                 if (cancellationToken.IsCancellationRequested)
                     return null;
+
+                bool isLeft = (i % 2 == 0);
+                short predictor = isLeft ? predictorL : predictorR;
 
                 // Compare actual sample with predicted value
                 int bit;
@@ -61,6 +73,10 @@ namespace AudioCompressor.Algorithms
 
                 // Clamp predictor
                 predictor = Math.Max((short)-32768, Math.Min((short)32767, predictor));
+
+                // Save predictor back
+                if (isLeft) predictorL = predictor;
+                else predictorR = predictor;
 
                 // Pack bit
                 bitBuffer = (bitBuffer << 1) | (uint)bit;
@@ -95,28 +111,38 @@ namespace AudioCompressor.Algorithms
         public short[] Decompress(byte[] data, CompressionSettings settings,
             IProgress<int> progress, CancellationToken cancellationToken)
         {
-            if (data == null || data.Length < 8)
+            if (data == null || data.Length < 12)
                 throw new ArgumentException("Invalid compressed data");
 
             // Read header
             int totalSamples = BitConverter.ToInt32(data, 0);
             int delta = BitConverter.ToInt32(data, 4);
+            short firstSample = BitConverter.ToInt16(data, 8);
 
             short[] samples = new short[totalSamples];
-            short predictor = 0;
-            int byteIndex = 8;
+            samples[0] = firstSample;
 
-            for (int i = 0; i < totalSamples; i++)
+            // Separate predictors for L and R channels
+            short predictorL = firstSample;
+            short predictorR = (totalSamples > 1) ? firstSample : (short)0;
+
+            int byteIndex = 12;
+
+            // Start from sample 1 (sample 0 from header)
+            for (int i = 1; i < totalSamples; i++)
             {
                 if (cancellationToken.IsCancellationRequested)
                     return null;
 
                 // Extract bit
-                int bitIndex = i % 8;
-                if (bitIndex == 0 && i > 0)
+                int bitIndex = (i - 1) % 8;
+                if (bitIndex == 0 && i > 1)
                     byteIndex++;
 
                 int bit = (data[byteIndex] >> (7 - bitIndex)) & 1;
+
+                bool isLeft = (i % 2 == 0);
+                short predictor = isLeft ? predictorL : predictorR;
 
                 // Reconstruct
                 if (bit == 1)
@@ -126,6 +152,11 @@ namespace AudioCompressor.Algorithms
 
                 // Clamp
                 predictor = Math.Max((short)-32768, Math.Min((short)32767, predictor));
+
+                // Save predictor back
+                if (isLeft) predictorL = predictor;
+                else predictorR = predictor;
+
                 samples[i] = predictor;
 
                 // Report progress

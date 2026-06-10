@@ -37,61 +37,27 @@ namespace AudioCompressor.Helpers
             return info;
         }
 
-        /// <summary>
-        /// Read all audio samples from a WAV file as 16-bit shorts
-        /// </summary>
         public static short[] ReadAudioSamples(string filePath)
         {
             using (var reader = new AudioFileReader(filePath))
             {
-                // Convert to 16-bit if needed
                 var waveFormat = new WaveFormat(reader.WaveFormat.SampleRate, 16, reader.WaveFormat.Channels);
 
                 using (var resampler = new MediaFoundationResampler(reader, waveFormat))
                 {
-                    // Calculate total samples
-                    int totalBytes = (int)(reader.Length / 2 * 2); // 16-bit = 2 bytes per sample
-                    if (reader.WaveFormat.BitsPerSample != 16)
+                    // نقرأ البيانات بطريقة ديناميكية عشان نتجنب مشكلة حجم المصفوفة
+                    var ms = new MemoryStream();
+                    byte[] tempBuffer = new byte[4096];
+                    int read;
+                    while ((read = resampler.Read(tempBuffer, 0, tempBuffer.Length)) > 0)
                     {
-                        totalBytes = (int)(reader.TotalTime.TotalSeconds * waveFormat.SampleRate * waveFormat.Channels * 2);
+                        ms.Write(tempBuffer, 0, read);
                     }
 
-                    // Read all data
-                    byte[] buffer = new byte[totalBytes];
-                    int bytesRead = 0;
-                    int chunkSize = 4096;
-                    byte[] tempBuffer = new byte[chunkSize];
-
-                    while (bytesRead < totalBytes)
-                    {
-                        int read = resampler.Read(tempBuffer, 0, Math.Min(chunkSize, totalBytes - bytesRead));
-                        if (read == 0) break;
-                        Array.Copy(tempBuffer, 0, buffer, bytesRead, read);
-                        bytesRead += read;
-                    }
-
-                    // Convert bytes to shorts (mono: take first channel only if stereo)
-                    int channels = waveFormat.Channels;
-                    int totalSamples = bytesRead / 2;
+                    byte[] buffer = ms.ToArray();
+                    int totalSamples = buffer.Length / 2;
                     short[] allSamples = new short[totalSamples];
-                    Buffer.BlockCopy(buffer, 0, allSamples, 0, bytesRead);
-
-                    //if (channels == 2)
-                    //{
-                    //    // Mix to mono: average left and right
-                    //    int monoSamples = totalSamples / 2;
-                    //    short[] mono = new short[monoSamples];
-                    //    for (int i = 0; i < monoSamples; i++)
-                    //    {
-                    //        mono[i] = (short)((allSamples[i * 2] + allSamples[i * 2 + 1]) / 2);
-                    //    }
-                    //    return mono;
-                    //}
-
-                    if (channels == 2)
-                    {
-                        return allSamples; // نرجع كل العينات بدون تحويل
-                    }
+                    Buffer.BlockCopy(buffer, 0, allSamples, 0, buffer.Length);
 
                     return allSamples;
                 }
