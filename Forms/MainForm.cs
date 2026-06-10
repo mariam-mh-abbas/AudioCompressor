@@ -90,7 +90,8 @@ namespace AudioCompressor
             {
                 Position = AxisPosition.Left,
                 Title = "Compression Ratio",
-                Minimum = 0
+                Minimum = 0,
+                Maximum = 20
             });
             var ratioSeries = new LineSeries
             {
@@ -407,14 +408,44 @@ namespace AudioCompressor
                             double speed = samplesSoFar / (elapsedMs / 1000.0) / 1000.0; // thousands/sec
 
                             // Estimate current compression ratio
+                            //long originalBytes = _originalSamples.Length * 2;
+                            //long estimatedCompressedBytes = (long)(originalBytes * (1.0 - percent / 200.0));
+                            //if (estimatedCompressedBytes > 0)
+                            //{
+                            //    double estimatedRatio = (double)originalBytes / estimatedCompressedBytes;
+                            //    _compressionRatioHistory.Add(Tuple.Create(percent, estimatedRatio));
+                            //}
+
+                            // بعد التعديل — تقدير ذكي حسب الخوارزمية
                             long originalBytes = _originalSamples.Length * 2;
-                            long estimatedCompressedBytes = (long)(originalBytes * (1.0 - percent / 200.0));
-                            if (estimatedCompressedBytes > 0)
+
+                            double estimatedRatio;
+                            AlgorithmType algo = settings.Algorithm;
+
+                            if (algo == AlgorithmType.DeltaModulation ||
+                                algo == AlgorithmType.AdaptiveDeltaModulation)
                             {
-                                double estimatedRatio = (double)originalBytes / estimatedCompressedBytes;
-                                _compressionRatioHistory.Add(Tuple.Create(percent, estimatedRatio));
+                                // Delta Modulation: 1 bit/عينة = نسبة 16:1 ثابتة
+                                estimatedRatio = 16.0;
+                            }
+                            else if (algo == AlgorithmType.DPCM ||
+                                     algo == AlgorithmType.PredictiveDifferentialCoding)
+                            {
+                                // DPCM/PDC: حسب DpcmBits
+                                estimatedRatio = 16.0 / settings.DpcmBits;
+                            }
+                            else if (algo == AlgorithmType.NonlinearQuantization)
+                            {
+                                // Nonlinear: حسب QuantizationLevels
+                                int bits = (int)Math.Log(settings.QuantizationLevels, 2);
+                                estimatedRatio = 16.0 / bits;
+                            }
+                            else
+                            {
+                                estimatedRatio = 2.0;
                             }
 
+                            _compressionRatioHistory.Add(Tuple.Create(percent, estimatedRatio));
                             _processingSpeedHistory.Add(Tuple.Create(percent, speed));
 
                             UpdateCharts();
@@ -452,7 +483,16 @@ namespace AudioCompressor
                     lblStatus.Text = $"Compression complete! Algorithm: {algorithm.AlgorithmName}";
 
                     // Show report
-                    ShowReport(settings, result.Length);
+                    // Decompress to calculate SNR
+                    short[] decompressed = null;
+                    try
+                    {
+                        decompressed = algorithm.Decompress(result, settings, null, CancellationToken.None);
+                    }
+                    catch { }
+
+                    // Show report with SNR
+                    ShowReport(settings, result.Length, decompressed);
                 }
             }
             catch (OperationCanceledException)
@@ -551,12 +591,23 @@ namespace AudioCompressor
 
         // ==================== CANCEL & RESET ====================
 
-        private void btnCancel_Click(object sender, EventArgs e)
+        //private void btnCancel_Click(object sender, EventArgs e)
+        //{
+        //    if (_cts != null && _isCompressing)
+        //    {
+        //        _cts.Cancel();
+        //        lblStatus.Text = "Cancelling...";
+        //    }
+        //}
+
+            private void btnCancel_Click(object sender, EventArgs e)
         {
             if (_cts != null && _isCompressing)
             {
                 _cts.Cancel();
-                lblStatus.Text = "Cancelling...";
+                lblStatus.Text = "Compression cancelled.";
+                progressBar1.Value = 0;
+                lblProgressPercent.Text = "0%";
             }
         }
 
@@ -638,7 +689,7 @@ namespace AudioCompressor
             panelQuantSettings.Visible = (algo == AlgorithmType.NonlinearQuantization);
             panelDpcmSettings.Visible = (algo == AlgorithmType.DPCM || algo == AlgorithmType.PredictiveDifferentialCoding);
             panelPredictiveSettings.Visible = (algo == AlgorithmType.PredictiveDifferentialCoding);
-            panelDeltaSettings.Visible = (algo == AlgorithmType.DeltaModulation);
+            panelDeltaSettings.Visible = (algo == AlgorithmType.DeltaModulation || algo == AlgorithmType.AdaptiveDeltaModulation);
             panelAdaptiveDeltaSettings.Visible = (algo == AlgorithmType.AdaptiveDeltaModulation);
         }
 
@@ -701,6 +752,21 @@ namespace AudioCompressor
                 if (settings.MinStepSize >= settings.MaxStepSize)
                 {
                     MessageBox.Show("Min step size must be less than max step size.", "Validation Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+            }
+            if (settings.Algorithm == AlgorithmType.PredictiveDifferentialCoding)
+            {
+                if (settings.PredictionOrder < 1 || settings.PredictionOrder > 4)
+                {
+                    MessageBox.Show("Prediction Order must be between 1 and 4.", "Validation Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+                if (settings.DpcmBits < 1 || settings.DpcmBits > 16)
+                {
+                    MessageBox.Show("DPCM Bits must be between 1 and 16.", "Validation Error",
                         MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return false;
                 }
@@ -819,8 +885,27 @@ namespace AudioCompressor
 
         // ==================== REPORT ====================
 
-        private void ShowReport(CompressionSettings settings, int compressedSize)
+        private void ShowReport(CompressionSettings settings, int compressedSize, short[] decompressedSamples = null)
         {
+            // Calculate SNR
+            double snr = 0;
+            if (decompressedSamples != null && decompressedSamples.Length == _originalSamples.Length)
+            {
+                double signalPower = 0;
+                double noisePower = 0;
+                for (int i = 0; i < _originalSamples.Length; i++)
+                {
+                    double signal = (double)_originalSamples[i];
+                    double noise = (double)_originalSamples[i] - (double)decompressedSamples[i];
+                    signalPower += signal * signal;
+                    noisePower += noise * noise;
+                }
+                if (noisePower > 0 && signalPower > 0)
+                    snr = 10.0 * Math.Log10(signalPower / noisePower);
+                else
+                    snr = 99.99;
+            }
+
             var report = new CompressionReport
             {
                 OriginalFileInfo = _currentFileInfo,
@@ -830,10 +915,10 @@ namespace AudioCompressor
                 CompressionRatio = (double)(_originalSamples.Length * 2) / compressedSize,
                 ElapsedTime = _compressionStopwatch.Elapsed,
                 AlgorithmName = _algorithms[settings.Algorithm].AlgorithmName,
-                Settings = settings
+                Settings = settings,
+                SNR = snr
             };
 
-            // Show report form
             var reportForm = new ReportForm(report);
             reportForm.ShowDialog(this);
         }
@@ -887,6 +972,11 @@ namespace AudioCompressor
             StopPlayback();
             _cts?.Cancel();
             base.OnFormClosing(e);
+        }
+
+        private void plotSpeed_Click(object sender, EventArgs e)
+        {
+
         }
 
         // ==================== TEST ====================
